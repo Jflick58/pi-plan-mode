@@ -84,8 +84,50 @@ function getBashOverride(entries: any[], command: string): boolean {
 	return false;
 }
 
+// Tools the agent is limited to while plan mode is active.
+export const PLAN_MODE_TOOLS = ["read", "bash"];
+// Safe fallback used when no snapshot of the pre-plan-mode active set exists
+// (e.g. resuming a session persisted before snapshots were recorded). Restores
+// core read/write access without re-declaring codemode/deferred tools.
+export const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write"];
+
+/**
+ * Compute the active tool set to restore when leaving plan mode.
+ *
+ * Starts from the snapshot captured on entry (or NORMAL_MODE_TOOLS as a safe
+ * fallback) and merges back any tools that became active during plan mode, such
+ * as tools loaded by tool_search. Never consults getAllTools(), so it cannot
+ * re-activate codemode/deferred tools that Pi deliberately keeps inactive.
+ */
+export function restoredToolSet(
+	savedActiveTools: string[] | undefined,
+	currentActiveTools: string[],
+): string[] {
+	const base = savedActiveTools ?? NORMAL_MODE_TOOLS;
+	const mergedFromCurrent = currentActiveTools.filter((name) => !PLAN_MODE_TOOLS.includes(name));
+	return [...new Set([...base, ...mergedFromCurrent])];
+}
+
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
+	// Snapshot of the active tool set captured when plan mode is entered, so it can
+	// be restored on exit. undefined when plan mode is off / not yet entered.
+	let savedActiveTools: string[] | undefined;
+
+	function enablePlanModeTools(): void {
+		// Snapshot the real active set the first time we enter plan mode. Do not
+		// overwrite an existing snapshot (e.g. one restored from a persisted session
+		// entry on resume).
+		if (savedActiveTools === undefined) {
+			savedActiveTools = pi.getActiveTools();
+		}
+		pi.setActiveTools(PLAN_MODE_TOOLS);
+	}
+
+	function restoreNormalModeTools(): void {
+		pi.setActiveTools(restoredToolSet(savedActiveTools, pi.getActiveTools()));
+		savedActiveTools = undefined;
+	}
 
 	function updateStatus(ctx: ExtensionContext): void {
 		if (planModeEnabled) {
@@ -98,6 +140,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	function persistState(ctx: ExtensionContext): void {
 		pi.appendEntry("plan-mode", {
 			active: planModeEnabled,
+			// Persist the snapshot so a resumed/forked session can restore the
+			// pre-plan-mode tool set without falling back to getAllTools().
+			savedActiveTools,
 			timestamp: new Date().toISOString(),
 		});
 	}
@@ -108,8 +153,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			planModeEnabled = !planModeEnabled;
 
 			if (planModeEnabled) {
+				enablePlanModeTools();
 				ctx.ui.notify("✅ Plan mode enabled - writes blocked", "info");
 			} else {
+				restoreNormalModeTools();
 				ctx.ui.notify("✅ Plan mode disabled - writes enabled", "info");
 			}
 
@@ -119,15 +166,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
-		if (planModeEnabled) {
-			// Hide write/edit tools entirely from the agent
-			pi.setActiveTools(["read", "bash"]);
-		} else {
-			// Restore all tools
-			const allTools = pi.getAllTools().map((t) => t.name);
-			pi.setActiveTools(allTools);
-		}
-
+		// Only act when plan mode is active. When it is off we leave the active tool
+		// set exactly as Pi configured it. The previous implementation called
+		// pi.setActiveTools(pi.getAllTools()) here on every prompt, which force-
+		// declared codemode/deferred tools (MCP servers, inactive extension tools)
+		// that Pi deliberately keeps inactive — ballooning the first turn from ~45K
+		// to ~385K tokens. Tool activation now happens only on the plan-mode
+		// transition (command handler) and on resume (session_start).
 		if (!planModeEnabled) return;
 
 		const instructions = `[PLAN MODE ACTIVE]
@@ -160,6 +205,16 @@ Help the user plan what needs to be done:
 
 		if (lastEntry && "data" in lastEntry && (lastEntry as any).data?.active === true) {
 			planModeEnabled = true;
+			const saved = (lastEntry as any).data?.savedActiveTools;
+			savedActiveTools = Array.isArray(saved) ? saved : undefined;
+			// Re-enforce the read/bash restriction for the resumed session. The
+			// snapshot comes only from the persisted entry — we must NOT snapshot the
+			// current active set here, because on resume it is already the restricted
+			// read/bash set, not the real pre-plan-mode tools. When no snapshot was
+			// persisted (sessions from an older version), savedActiveTools stays
+			// undefined so leaving plan mode falls back to NORMAL_MODE_TOOLS without
+			// ever calling getAllTools().
+			pi.setActiveTools(PLAN_MODE_TOOLS);
 			updateStatus(ctx);
 			ctx.ui.notify("i️ Plan mode restored", "info");
 		}

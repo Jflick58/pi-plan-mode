@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { isWhitelisted } from "./plan-mode.js";
+import { isWhitelisted, restoredToolSet, NORMAL_MODE_TOOLS, PLAN_MODE_TOOLS } from "./plan-mode.js";
 
 describe("plan-mode whitelist", () => {
 	describe("commands without trailing space", () => {
@@ -71,6 +71,43 @@ describe("plan-mode whitelist", () => {
 
 		it("should whitelist cat with file", () => {
 			expect(isWhitelisted("cat file.ts")).toBe(true);
+		});
+	});
+
+	describe("restoredToolSet (leaving plan mode)", () => {
+		it("restores the exact snapshot captured on entry", () => {
+			const snapshot = ["read", "bash", "edit", "write", "task_create"];
+			// While in plan mode only read/bash were active.
+			expect(restoredToolSet(snapshot, PLAN_MODE_TOOLS)).toEqual(snapshot);
+		});
+
+		it("merges tools that became active during plan mode (e.g. tool_search loads)", () => {
+			const snapshot = ["read", "bash", "edit", "write"];
+			const current = ["read", "bash", "mcp__tool-gateway__some_tool"];
+			expect(restoredToolSet(snapshot, current)).toEqual([
+				"read",
+				"bash",
+				"edit",
+				"write",
+				"mcp__tool-gateway__some_tool",
+			]);
+		});
+
+		it("falls back to NORMAL_MODE_TOOLS when no snapshot exists", () => {
+			// Resume of a session persisted before snapshots were recorded: current
+			// active set is the restricted read/bash.
+			expect(restoredToolSet(undefined, ["read", "bash"])).toEqual(NORMAL_MODE_TOOLS);
+		});
+
+		it("never re-adds codemode/deferred tools (no getAllTools) on fallback", () => {
+			const restored = restoredToolSet(undefined, ["read", "bash"]);
+			expect(restored.some((t) => t.startsWith("mcp__"))).toBe(false);
+		});
+
+		it("does not duplicate read/bash", () => {
+			const restored = restoredToolSet(["read", "bash", "edit"], ["read", "bash"]);
+			expect(restored.filter((t) => t === "read")).toHaveLength(1);
+			expect(restored.filter((t) => t === "bash")).toHaveLength(1);
 		});
 	});
 
